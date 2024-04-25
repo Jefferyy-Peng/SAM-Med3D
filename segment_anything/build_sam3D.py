@@ -43,13 +43,14 @@ def build_sam3D_vit_b(checkpoint=None):
         checkpoint=checkpoint,
     )
 
-def build_sam3D_vit_b_ori(checkpoint=None):
+def build_sam3D_vit_b_ori(checkpoint=None, freeze=(True, True, True)):
     return _build_sam3D_ori(
         encoder_embed_dim=768,
         encoder_depth=12,
         encoder_num_heads=12,
         encoder_global_attn_indexes=[2, 5, 8, 11],
         checkpoint=checkpoint,
+        freeze=freeze
     )
 
 
@@ -69,7 +70,9 @@ def _build_sam3D(
     encoder_num_heads,
     encoder_global_attn_indexes,
     checkpoint=None,
+    freeze = (True, True, True)
 ):
+    freeze_image_encoder, freeze_prompt_encoder, freeze_mask_decoder = freeze
     prompt_embed_dim = 384
     image_size = 256
     vit_patch_size = 16
@@ -86,20 +89,23 @@ def _build_sam3D(
             qkv_bias=True,
             use_rel_pos=True,
             global_attn_indexes=encoder_global_attn_indexes,
-            window_size=14,
+            window_size=8,
             out_chans=prompt_embed_dim,
+            freeze=freeze_image_encoder
         ),
         prompt_encoder=PromptEncoder3D(
             embed_dim=prompt_embed_dim,
             image_embedding_size=(image_embedding_size, image_embedding_size, image_embedding_size),
             input_image_size=(image_size, image_size, image_size),
             mask_in_chans=16,
+            freeze=freeze_prompt_encoder
         ),
         mask_decoder=MaskDecoder3D(
             num_multimask_outputs=3,
             transformer_dim=prompt_embed_dim,
             iou_head_depth=3,
             iou_head_hidden_dim=256,
+            freeze=freeze_mask_decoder
         ),
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
@@ -118,11 +124,13 @@ def _build_sam3D_ori(
     encoder_num_heads,
     encoder_global_attn_indexes,
     checkpoint=None,
+    freeze=(True, True, True)
 ):
     prompt_embed_dim = 384
     image_size = 128
     vit_patch_size = 16
     image_embedding_size = image_size // vit_patch_size
+    freeze_image_encoder, freeze_prompt_encoder, freeze_mask_decoder = freeze
     sam = Sam3D(
         image_encoder=ImageEncoderViT3D(
             depth=encoder_depth,
@@ -137,18 +145,21 @@ def _build_sam3D_ori(
             global_attn_indexes=encoder_global_attn_indexes,
             window_size=14,
             out_chans=prompt_embed_dim,
+            freeze=freeze_image_encoder
         ),
         prompt_encoder=PromptEncoder3D(
             embed_dim=prompt_embed_dim,
             image_embedding_size=(image_embedding_size, image_embedding_size, image_embedding_size),
             input_image_size=(image_size, image_size, image_size),
             mask_in_chans=16,
+            freeze=freeze_prompt_encoder
         ),
         mask_decoder=MaskDecoder3D(
             num_multimask_outputs=3,
             transformer_dim=prompt_embed_dim,
             iou_head_depth=3,
             iou_head_hidden_dim=256,
+            freeze=freeze_mask_decoder
         ),
         pixel_mean=[123.675, 116.28, 103.53],
         pixel_std=[58.395, 57.12, 57.375],
@@ -157,5 +168,5 @@ def _build_sam3D_ori(
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
-        sam.load_state_dict(state_dict)
+        sam.load_state_dict(state_dict['model_state_dict'])
     return sam

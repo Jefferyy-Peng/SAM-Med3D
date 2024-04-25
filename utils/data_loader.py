@@ -42,6 +42,7 @@ class Dataset_Union_ALL(Dataset):
 
         sitk_image_arr, _ = sitk_to_nib(sitk_image)
         sitk_label_arr, _ = sitk_to_nib(sitk_label)
+        c, w, h, d = sitk_image_arr.shape
 
         subject = tio.Subject(
             image = tio.ScalarImage(tensor=sitk_image_arr),
@@ -50,6 +51,8 @@ class Dataset_Union_ALL(Dataset):
 
         if '/ct_' in self.image_paths[index]:
             subject = tio.Clamp(-1000,1000)(subject)
+        else:
+            subject = tio.Clamp(0, 2000)(subject)
 
         if self.transform:
             try:

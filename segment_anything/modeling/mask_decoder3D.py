@@ -291,6 +291,7 @@ class MaskDecoder3D(nn.Module):
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
+        freeze: bool = False,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -341,6 +342,9 @@ class MaskDecoder3D(nn.Module):
         self.iou_prediction_head = MLP(
             transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
         )
+        if freeze:
+            for param in self.parameters():
+                param.requires_grad = False
 
     def forward(
         self,

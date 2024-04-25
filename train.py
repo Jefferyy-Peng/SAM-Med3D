@@ -5,12 +5,17 @@ import datetime
 import logging
 import matplotlib.pyplot as plt
 import os
+
+from models.model_single import ModelEmb
+from models.unet import UNet
+
 join = os.path.join
 from tqdm import tqdm
 from torch.backends import cudnn
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.nn as nn
 import torchio as tio
 from torch.utils.data.distributed import DistributedSampler
 from segment_anything.build_sam3D import sam_model_registry3D
@@ -27,20 +32,21 @@ from utils.data_paths import img_datas
 
 # %% set up parser
 parser = argparse.ArgumentParser()
-parser.add_argument('--task_name', type=str, default='union_train')
+parser.add_argument('--task_name', type=str, default='sam3d')
 parser.add_argument('--click_type', type=str, default='random')
 parser.add_argument('--multi_click', action='store_true', default=False)
 parser.add_argument('--model_type', type=str, default='vit_b_ori')
-parser.add_argument('--checkpoint', type=str, default='ckpt/sam_med3d.pth')
+parser.add_argument('--checkpoint', type=str, default='./ckpt/sam_med3d_turbo.pth')
 parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--work_dir', type=str, default='work_dir')
 
 # train
-parser.add_argument('--num_workers', type=int, default=24)
-parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0,1])
-parser.add_argument('--multi_gpu', action='store_true', default=False)
+parser.add_argument('--num_workers', type=int, default=12)
+parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0,1,2])
+parser.add_argument('--multi_gpu', action='store_true', default=True)
 parser.add_argument('--resume', action='store_true', default=False)
 parser.add_argument('--allow_partial_weight', action='store_true', default=False)
+parser.add_argument('--hack_prompt', type=bool, default=True)
 
 # lr_scheduler
 parser.add_argument('--lr_scheduler', type=str, default='multisteplr')
@@ -48,13 +54,22 @@ parser.add_argument('--step_size', type=list, default=[120, 180])
 parser.add_argument('--gamma', type=float, default=0.1)
 parser.add_argument('--num_epochs', type=int, default=200)
 parser.add_argument('--img_size', type=int, default=128)
-parser.add_argument('--batch_size', type=int, default=12)
+parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--accumulation_steps', type=int, default=20)
 parser.add_argument('--lr', type=float, default=8e-4)
 parser.add_argument('--weight_decay', type=float, default=0.1)
 parser.add_argument('--port', type=int, default=12361)
 
+# prompt generator
+parser.add_argument('-depth_wise', '--depth_wise', default=False, help='image size', required=False)
+parser.add_argument('-order', '--order', default=85, help='image size', required=False)
+
 args = parser.parse_args()
+# args.lr = 8e-5
+args.num_epochs = 50
+args.accumulation_steps = 1
+args.hack_prompt = True
+
 
 device = args.device
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
@@ -67,10 +82,25 @@ MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 def build_model(args):
-    sam_model = sam_model_registry3D[args.model_type](checkpoint=None).to(device)
+    freeze = (True, True, True, False)
+    sam_model = sam_model_registry3D[args.model_type](checkpoint=args.checkpoint, freeze=freeze[:3]).to(device)
+    prompt_model = ModelEmb(args=args, freeze=freeze[3]).to(device)
+    # prompt_model = UNet(spatial_dims=3,
+    #         in_channels=1,
+    #         out_channels=384,
+    #         strides=[(2, 2, 2), (1, 2, 2), (1, 2, 2), (1, 2, 2), (2, 2, 2)],
+    #         channels=[32, 64, 128, 256, 512, 1024]).to(device)
     if args.multi_gpu:
-        sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank)
-    return sam_model
+        if freeze[:3]==(True, True, True):
+            # sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank, find_unused_parameters=True)
+            prompt_model = DDP(prompt_model, device_ids=[args.rank], output_device=args.rank,
+                               find_unused_parameters=True)
+        elif freeze[3]==(True):
+            sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank, find_unused_parameters=True)
+        else:
+            sam_model = DDP(sam_model, device_ids=[args.rank], output_device=args.rank, find_unused_parameters=True)
+            prompt_model = DDP(prompt_model, device_ids=[args.rank], output_device=args.rank, find_unused_parameters=True)
+    return sam_model, prompt_model
 
 
 def get_dataloaders(args):
@@ -99,9 +129,10 @@ def get_dataloaders(args):
     return train_dataloader
 
 class BaseTrainer:
-    def __init__(self, model, dataloaders, args):
+    def __init__(self, model, prompt_model, dataloaders, args):
 
         self.model = model
+        self.prompt_model = prompt_model
         self.dataloaders = dataloaders
         self.args = args
         self.best_loss = np.inf
@@ -125,16 +156,27 @@ class BaseTrainer:
         self.seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
     
     def set_optimizer(self):
-        if self.args.multi_gpu:
+        if hasattr(self.model, 'module'):
             sam_model = self.model.module
         else:
             sam_model = self.model
-
-        self.optimizer = torch.optim.AdamW([
-            {'params': sam_model.image_encoder.parameters()}, # , 'lr': self.args.lr * 0.1},
-            {'params': sam_model.prompt_encoder.parameters() , 'lr': self.args.lr * 0.1},
-            {'params': sam_model.mask_decoder.parameters(), 'lr': self.args.lr * 0.1},
-        ], lr=self.args.lr, betas=(0.9,0.999), weight_decay=self.args.weight_decay)
+        if hasattr(self.prompt_model, 'module'):
+            prompt_model = self.prompt_model.module
+        else:
+            prompt_model = self.prompt_model
+        if self.args.hack_prompt:
+            self.optimizer = torch.optim.AdamW([
+                {'params': sam_model.image_encoder.parameters()}, # , 'lr': self.args.lr * 0.1},
+                {'params': sam_model.prompt_encoder.parameters() , 'lr': self.args.lr * 0.1},
+                {'params': sam_model.mask_decoder.parameters(), 'lr': self.args.lr * 0.1},
+                {'params': prompt_model.parameters(), 'lr': self.args.lr * 0.1}
+            ], lr=self.args.lr, betas=(0.9,0.999), weight_decay=self.args.weight_decay)
+        else:
+            self.optimizer = torch.optim.AdamW([
+                {'params': sam_model.image_encoder.parameters()},  # , 'lr': self.args.lr * 0.1},
+                {'params': sam_model.prompt_encoder.parameters(), 'lr': self.args.lr * 0.1},
+                {'params': sam_model.mask_decoder.parameters(), 'lr': self.args.lr * 0.1},
+            ], lr=self.args.lr, betas=(0.9, 0.999), weight_decay=self.args.weight_decay)
 
     def set_lr_scheduler(self):
         if self.args.lr_scheduler == "multisteplr":
@@ -161,12 +203,12 @@ class BaseTrainer:
         
         if last_ckpt:
             if(self.args.allow_partial_weight):
-                if self.args.multi_gpu:
+                if hasattr(self.model, 'module'):
                     self.model.module.load_state_dict(last_ckpt['model_state_dict'], strict=False)
                 else:
                     self.model.load_state_dict(last_ckpt['model_state_dict'], strict=False)
             else:
-                if self.args.multi_gpu:
+                if hasattr(self.model, 'module'):
                     self.model.module.load_state_dict(last_ckpt['model_state_dict'])
                 else:
                     self.model.load_state_dict(last_ckpt['model_state_dict'])
@@ -185,7 +227,7 @@ class BaseTrainer:
             self.start_epoch = 0
             print(f"No checkpoint found at {ckp_path}, start training from scratch")
 
-    def save_checkpoint(self, epoch, state_dict, describe="last"):
+    def save_checkpoint(self, epoch, state_dict, model_name, describe="last"):
         torch.save({
             "epoch": epoch + 1,
             "model_state_dict": state_dict,
@@ -197,8 +239,25 @@ class BaseTrainer:
             "best_dice": self.best_dice,
             "args": self.args,
             "used_datas": img_datas,
-        }, join(MODEL_SAVE_PATH, f"sam_model_{describe}.pth"))
-    
+        }, join(MODEL_SAVE_PATH, f"{model_name}_{describe}.pth"))
+
+    def batch_auto_forward(self, sam_model, image_embedding, dense_embeddings, gt3D):
+
+        sparse_embeddings_none, dense_embeddings_none = sam_model.prompt_encoder(
+            points=None,
+            boxes=None,
+            masks=None,
+        )
+        low_res_masks, iou_predictions = sam_model.mask_decoder(
+            image_embeddings=image_embedding.to(device),  # (B, 256, 64, 64)
+            image_pe=sam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+            sparse_prompt_embeddings=sparse_embeddings_none,  # (B, 2, 256)
+            dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
+            multimask_output=False,
+        )
+        prev_masks = F.interpolate(low_res_masks, size=gt3D.shape[-3:], mode='trilinear', align_corners=False)
+        return low_res_masks, prev_masks
+
     def batch_forward(self, sam_model, image_embedding, gt3D, low_res_masks, points=None):
         
         sparse_embeddings, dense_embeddings = sam_model.prompt_encoder(
@@ -235,6 +294,13 @@ class BaseTrainer:
             points_input = points_co
             labels_input = points_la
         return points_input, labels_input
+
+    def auto_decode(self, sam_model, image_embedding, dense_embeddings, gt3D):
+        return_loss = 0
+        low_res_masks, prev_masks = self.batch_auto_forward(sam_model, image_embedding, dense_embeddings, gt3D)
+        loss = self.seg_loss(prev_masks, gt3D)
+        return_loss += loss
+        return prev_masks, return_loss
 
     def interaction(self, sam_model, image_embedding, gt3D, num_clicks):
         return_loss = 0
@@ -278,12 +344,21 @@ class BaseTrainer:
         epoch_iou = 0
         epoch_dice = 0
         self.model.train()
-        if self.args.multi_gpu:
+        if hasattr(self.model, 'module'):
             sam_model = self.model.module
         else:
             sam_model = self.model
+            # self.args.rank = -1
+
+        if hasattr(self.prompt_model, 'module'):
+            prompt_model = self.prompt_model.module
+        else:
+            prompt_model = self.prompt_model
+            # self.args.rank = -1
+
+        if not self.args.multi_gpu:
             self.args.rank = -1
-        
+
         if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
             tbar = tqdm(self.dataloaders)
         else:
@@ -293,32 +368,42 @@ class BaseTrainer:
         step_loss = 0
         for step, (image3D, gt3D) in enumerate(tbar):
 
-            my_context = self.model.no_sync if self.args.rank != -1 and step % self.args.accumulation_steps != 0 else nullcontext
+            my_context1 = self.model.no_sync if hasattr(self.model, 'module') and step % self.args.accumulation_steps != 0 else nullcontext
+            my_context2 = self.prompt_model.no_sync if hasattr(self.prompt_model, 'module') and step % self.args.accumulation_steps != 0 else nullcontext
 
-            with my_context():
+            with my_context1():
+                with my_context2():
 
-                image3D = self.norm_transform(image3D.squeeze(dim=1)) # (N, C, W, H, D)
-                image3D = image3D.unsqueeze(dim=1)
-                
-                image3D = image3D.to(device)
-                gt3D = gt3D.to(device).type(torch.long)
-                with amp.autocast():
-                    image_embedding = sam_model.image_encoder(image3D)
+                    image3D = self.norm_transform(image3D.squeeze(dim=1)) # (N, C, W, H, D)
+                    image3D = image3D.unsqueeze(dim=1)
 
-                    self.click_points = []
-                    self.click_labels = []
+                    image3D = image3D.to(device)
+                    gt3D = gt3D.to(device).type(torch.long)
+                    with amp.autocast():
+                        if self.args.hack_prompt:
+                            image_embedding = sam_model.image_encoder(image3D)
+                            dense_embeddings = prompt_model(image3D)
+                            prev_masks, loss = self.auto_decode(sam_model, image_embedding, dense_embeddings,  gt3D)
+                            pred_list = []
+                        else:
+                            image_embedding = sam_model.image_encoder(image3D)
 
-                    pred_list = []
+                            self.click_points = []
+                            self.click_labels = []
 
-                    prev_masks, loss = self.interaction(sam_model, image_embedding, gt3D, num_clicks=11)                
+                            pred_list = []
 
-                epoch_loss += loss.item()
+                            prev_masks, loss = self.interaction(sam_model, image_embedding, gt3D, num_clicks=11)
+                    pred_mask = prev_masks.clone().detach()
+                    epoch_dice += self.get_dice_score(torch.sigmoid(pred_mask), gt3D)
 
-                cur_loss = loss.item()
+                    epoch_loss += loss.item()
 
-                loss /= self.args.accumulation_steps
-                
-                self.scaler.scale(loss).backward()    
+                    cur_loss = loss.item()
+
+                    loss /= self.args.accumulation_steps
+
+                    self.scaler.scale(loss).backward()
 
             if step % self.args.accumulation_steps == 0 and step != 0:
                 self.scaler.step(self.optimizer)
@@ -340,12 +425,20 @@ class BaseTrainer:
                             self.save_checkpoint(
                                 epoch,
                                 sam_model.state_dict(),
+                                model_name='sam_model',
+                                describe=f'{epoch}_step_dice:{print_dice}_best'
+                            )
+                            self.save_checkpoint(
+                                epoch,
+                                prompt_model.state_dict(),
+                                model_name='prompt_model',
                                 describe=f'{epoch}_step_dice:{print_dice}_best'
                             )
                     if print_loss < self.step_best_loss:
                         self.step_best_loss = print_loss
             
         epoch_loss /= step
+        epoch_dice /= step
 
         return epoch_loss, epoch_iou, epoch_dice, pred_list
 
@@ -384,15 +477,29 @@ class BaseTrainer:
                 print(f'EPOCH: {epoch}, Dice: {epoch_dice}')
                 logger.info(f'Epoch\t {epoch}\t : loss: {epoch_loss}, dice: {epoch_dice}')
 
-                if self.args.multi_gpu:
-                    state_dict = self.model.module.state_dict()
+                if hasattr(self.model, 'module'):
+                    sam_state_dict = self.model.module.state_dict()
                 else:
-                    state_dict = self.model.state_dict()
+                    sam_state_dict = self.model.state_dict()
+
+                if hasattr(self.prompt_model, 'module'):
+                    prompt_state_dict = self.prompt_model.module.state_dict()
+                else:
+                    prompt_state_dict = self.prompt_model.state_dict()
+
                 
                 # save latest checkpoint
                 self.save_checkpoint(
                     epoch, 
-                    state_dict, 
+                    sam_state_dict,
+                    model_name='sam_model',
+                    describe='latest'
+                )
+
+                self.save_checkpoint(
+                    epoch,
+                    prompt_state_dict,
+                    model_name='prompt_model',
                     describe='latest'
                 )
 
@@ -401,7 +508,14 @@ class BaseTrainer:
                     self.best_loss = epoch_loss
                     self.save_checkpoint(
                         epoch,
-                        state_dict,
+                        sam_state_dict,
+                        model_name='sam_model',
+                        describe='loss_best'
+                    )
+                    self.save_checkpoint(
+                        epoch,
+                        prompt_state_dict,
+                        model_name='prompt_model',
                         describe='loss_best'
                     )
                 
@@ -410,7 +524,14 @@ class BaseTrainer:
                     self.best_dice = epoch_dice
                     self.save_checkpoint(
                         epoch,
-                        state_dict,
+                        sam_state_dict,
+                        model_name='sam_model',
+                        describe='dice_best'
+                    )
+                    self.save_checkpoint(
+                        epoch,
+                        prompt_state_dict,
+                        model_name='prompt_model',
                         describe='dice_best'
                     )
 
@@ -496,8 +617,8 @@ def main_worker(rank, args):
         filename=os.path.join(LOG_OUT_DIR, f'output_{cur_time}.log'))
     
     dataloaders = get_dataloaders(args)
-    model = build_model(args)
-    trainer = BaseTrainer(model, dataloaders, args)
+    model, prompt_model = build_model(args)
+    trainer = BaseTrainer(model, prompt_model, dataloaders, args)
     trainer.train()
     cleanup()
 

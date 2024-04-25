@@ -34,6 +34,7 @@ class PromptEncoder3D(nn.Module):
         input_image_size: Tuple[int, int, int],
         mask_in_chans: int,
         activation: Type[nn.Module] = nn.GELU,
+        freeze: bool = False,
     ) -> None:
         """
         Encodes prompts for input to SAM's mask decoder.
@@ -71,6 +72,9 @@ class PromptEncoder3D(nn.Module):
             nn.Conv3d(mask_in_chans, embed_dim, kernel_size=1),
         )
         self.no_mask_embed = nn.Embedding(1, embed_dim)
+        if freeze:
+            for param in self.parameters():
+                param.requires_grad = False
 
     def get_dense_pe(self) -> torch.Tensor:
         """

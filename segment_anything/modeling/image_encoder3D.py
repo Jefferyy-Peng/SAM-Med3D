@@ -61,6 +61,7 @@ class ImageEncoderViT3D(nn.Module):
         rel_pos_zero_init: bool = True,
         window_size: int = 0,
         global_attn_indexes: Tuple[int, ...] = (),
+        freeze: bool = False,
     ) -> None:
         """
         Args:
@@ -132,6 +133,9 @@ class ImageEncoderViT3D(nn.Module):
             LayerNorm3d(out_chans),
             # nn.LayerNorm(out_chans),
         )
+        if freeze:
+            for param in self.parameters():
+                param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # input_size = [1,1,256,256,256]
