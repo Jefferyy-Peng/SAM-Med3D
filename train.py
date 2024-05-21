@@ -92,14 +92,14 @@ args.num_epochs = 50
 args.accumulation_steps = 1
 args.hack_prompt = True
 args.loss_fn = 'dice_ce'
-args.gpu_ids = [2, 3]
+args.gpu_ids = [0, 1, 2, 3]
 args.batch_size = 1
-args.multi_gpu = False
+args.multi_gpu = True
 
 grid_search_params = {
-    "weight_decay": [0.1, 0.01],
-    "lr": [1e-3, 1e-4, 1e-5],
-    "beta": [0.9, 0.8, 0.7]
+    "weight_decay": [0.01],
+    "lr": [1e-3],
+    "beta": [0.9]
 }
 
 param_grid = ParameterGrid(grid_search_params)
@@ -624,84 +624,6 @@ def device_config(args):
     except RuntimeError as e:
         print(e)
 
-def get_dice_score(prev_masks, gt3D):
-    def compute_dice(mask_pred, mask_gt):
-        mask_threshold = 0.5
-        mask_pred = (mask_pred > mask_threshold)
-        mask_gt = (mask_gt > 0)
-        volume_sum = mask_gt.sum() + mask_pred.sum()
-        volume_intersect = (mask_gt & mask_pred).sum()
-        return (2 * volume_intersect + 1e-5) / (volume_sum + 1e-5)
-    pred_masks = (prev_masks > 0.5)
-    true_masks = (gt3D > 0)
-    dice_list = []
-    for i in range(true_masks.shape[0]):
-        dice_list.append(compute_dice(pred_masks[i], true_masks[i]))
-    return (sum(dice_list) / len(dice_list)).item()
-def train_one_epoch(epoch, model, dataloaders, optimizer, norm_transform, criterion, scaler):
-    epoch_loss = 0
-    epoch_iou = 0
-    epoch_dice = 0
-    model.train()
-
-    tbar = dataloaders
-
-    optimizer.zero_grad()
-    step_loss = 0
-    volumes = []
-    dices = []
-    step_best_dice = 0
-    step_best_loss = np.inf
-    for step, (image3D, gt3D) in enumerate(tbar):
-
-        my_context1 = nullcontext
-        my_context2 = nullcontext
-
-        with my_context1():
-            with my_context2():
-
-                image3D = norm_transform(image3D.squeeze(dim=1))  # (N, C, W, H, D)
-                image3D = image3D.unsqueeze(dim=1)
-
-                image3D = image3D.to(device)
-                gt3D = gt3D.to(device).type(torch.long)
-                with amp.autocast():
-                    pred = model(image3D)
-                    loss = criterion(pred, gt3D)
-                pred_mask = pred.clone().detach()
-                epoch_dice += get_dice_score(torch.sigmoid(pred_mask), gt3D)
-
-                epoch_loss += loss.item()
-
-                cur_loss = loss.item()
-
-                scaler.scale(loss).backward()
-
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-        step_loss += cur_loss
-        print_loss = step_loss
-        step_loss = 0
-        print_dice = get_dice_score(torch.sigmoid(pred_mask), gt3D)
-
-        print(f'Epoch: {epoch}, Step: {step}, Loss: {print_loss}, Dice: {print_dice}')
-        if print_dice > step_best_dice:
-            step_best_dice = print_dice
-        if print_loss < step_best_loss:
-            step_best_loss = print_loss
-
-    epoch_loss /= step
-    epoch_dice /= step
-    return epoch_loss, epoch_dice
-def plot_result(self, plot_data, description, save_name):
-    plt.plot(plot_data)
-    plt.title(description)
-    plt.xlabel('Epoch')
-    plt.ylabel(f'{save_name}')
-    plt.savefig(join('./', f'{save_name}.png'))
-    plt.close()
-
 def main():
     for params in param_grid:
         global task_name
@@ -727,47 +649,11 @@ def main():
             # Load datasets
             dataloaders = get_dataloaders(args)
             # Build model
-            # model = build_model(args)
-            model = SwinUNETR(
-            img_size=(128, 128, 128),
-            in_channels=1,
-            out_channels=1,
-            feature_size=48,
-            use_checkpoint=False,
-        ).to(device)
+            model = build_model(args)
             # # Create trainer
-            # trainer = BaseTrainer(model, dataloaders, args)
+            trainer = BaseTrainer(model, dataloaders, args)
             # # Train
-            # trainer.train()
-            norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
-            scaler = amp.GradScaler()
-            optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
-            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
-                                                                [1, 2],
-                                                                0.1)
-            criterion = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
-            losses = []
-            dices = []
-            best_dice = 0
-
-            for epoch in range(args.num_epochs):
-                print(f'Epoch: {epoch}/{args.num_epochs - 1}')
-
-                epoch_loss, epoch_dice = train_one_epoch(epoch, model, dataloaders, optimizer, norm_transform, criterion, scaler)
-
-                lr_scheduler.step()
-
-                losses.append(epoch_loss)
-                dices.append(epoch_dice)
-                print(f'EPOCH: {epoch}, Loss: {epoch_loss}')
-                print(f'EPOCH: {epoch}, Dice: {epoch_dice}')
-
-                    # save train dice best checkpoint
-                if epoch_dice > best_dice:
-                    best_dice = epoch_dice
-
-                plot_result(losses, 'Dice + Cross Entropy Loss', 'Loss', 'loss')
-                plot_result(dices, 'Dice', 'Dice', 'dice')
+            trainer.train()
 
 def main_worker(rank, args):
     setup(rank, args.world_size)
