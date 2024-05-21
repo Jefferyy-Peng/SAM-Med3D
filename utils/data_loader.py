@@ -9,6 +9,8 @@ import torch
 import SimpleITK as sitk
 from prefetch_generator import BackgroundGenerator
 
+from utils.plot import plot_segmentation2D
+
 
 class Dataset_Union_ALL(Dataset): 
     def __init__(self, paths, mode='train', data_type='Tr', image_size=128, 
@@ -42,7 +44,8 @@ class Dataset_Union_ALL(Dataset):
 
         sitk_image_arr, _ = sitk_to_nib(sitk_image)
         sitk_label_arr, _ = sitk_to_nib(sitk_label)
-        c, w, h, d = sitk_image_arr.shape
+        orig_shape = sitk_image_arr.shape[1:] # c, w, h, d
+        # plot_segmentation2D(sitk_image_arr.squeeze(0), np.zeros_like(sitk_image_arr).squeeze(0), sitk_label_arr.squeeze(0), './show_samples')
 
         subject = tio.Subject(
             image = tio.ScalarImage(tensor=sitk_image_arr),
@@ -60,6 +63,9 @@ class Dataset_Union_ALL(Dataset):
             except:
                 print(self.image_paths[index])
 
+        # plot_segmentation2D(subject.image.data.squeeze(0), torch.zeros_like(subject.image.data).squeeze(0),
+        #                     subject.label.data.squeeze(0), './show_samples')
+
         if(self.pcc):
             print("using pcc setting")
             # crop from random click point
@@ -76,11 +82,12 @@ class Dataset_Union_ALL(Dataset):
                 subject = tio.CropOrPad(mask_name='crop_mask', 
                                         target_shape=(self.image_size,self.image_size,self.image_size))(subject)
 
-        if subject.label.data.sum() <= self.threshold:
-            return self.__getitem__(np.random.randint(self.__len__()))
+        # don't want to ignore empty cases
+        # if subject.label.data.sum() <= self.threshold:
+        #     return self.__getitem__(np.random.randint(self.__len__()))
         
         if self.mode == "train" and self.data_type == 'Tr':
-            return subject.image.data.clone().detach(), subject.label.data.clone().detach()
+            return subject.image.data.clone().detach().to(torch.int32), subject.label.data.clone().detach().to(torch.int8)
         elif self.get_all_meta_info:
             meta_info = {
                 "image_path": self.image_paths[index],
@@ -88,9 +95,9 @@ class Dataset_Union_ALL(Dataset):
                 "direction": sitk_label.GetDirection(),
                 "spacing": sitk_label.GetSpacing(),
             }
-            return subject.image.data.clone().detach(), subject.label.data.clone().detach(), meta_info   
+            return subject.image.data.clone().detach().to(torch.int32), subject.label.data.clone().detach().to(torch.int8), meta_info
         else:
-            return subject.image.data.clone().detach(), subject.label.data.clone().detach(), self.image_paths[index]   
+            return subject.image.data.clone().detach().to(torch.int32), subject.label.data.clone().detach().to(torch.int8), self.image_paths[index], orig_shape
  
     def _set_file_paths(self, paths):
         self.image_paths = []

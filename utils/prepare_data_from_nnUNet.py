@@ -16,7 +16,7 @@ import nibabel as nib
 from tqdm import tqdm
 import torchio as tio
 
-def resample_nii(input_path: str, output_path: str, target_spacing: tuple = (1, 1, 1), n=None, reference_image=None, mode="linear"):
+def resample_nii(input_path: str, output_path: str, target_spacing: tuple = (1.5, 1.5, 1.5), n=None, reference_image=None, mode="linear"):
     """
     Resample a nii.gz file to a specified spacing using torchio.
 
@@ -52,12 +52,12 @@ def resample_nii(input_path: str, output_path: str, target_spacing: tuple = (1, 
     
     save_image.save(output_path)
 
-dataset_root = "/home/yunxiangpeng/PycharmProjects/SAM-Med3D/sam3d_train/medical_data_all"
+dataset_root = "/home/yxpengcs/PycharmProjects/SAM-Med3D/sam3d_train/medical_data_all"
 dataset_list = [
-    'prostate/PROMISE12_mr_unknown',
+    'prostate/picai',
 ]
 
-target_dir = "/home/yunxiangpeng/PycharmProjects/SAM-Med3D/sam3d_train/medical_preprocessed"
+target_dir = "/home/yxpengcs/PycharmProjects/SAM-Med3D/sam3d_train/medical_preprocessed"
 
 
 for dataset in dataset_list:
@@ -97,7 +97,7 @@ for dataset in dataset_list:
             gt_arr[gt_arr != idx] = 0
             gt_arr[gt_arr != 0] = 1
             volume = gt_arr.sum()*spacing_voxel
-            if(volume<10): 
+            if(volume<10):
                 print("skip", target_img_path)
                 continue
 

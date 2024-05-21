@@ -8,6 +8,9 @@ import os
 
 from models.model_single import ModelEmb
 from models.unet import UNet
+from monai.losses import FocalLoss
+
+from utils.Losses import FocalDiceLoss
 
 join = os.path.join
 from tqdm import tqdm
@@ -28,11 +31,26 @@ from contextlib import nullcontext
 from utils.click_method import get_next_click3D_torch_2
 from utils.data_loader import Dataset_Union_ALL, Union_Dataloader
 from utils.data_paths import img_datas
+import torch.nn.functional as F
+from sklearn.model_selection import ParameterGrid
+from monai.networks.nets import SwinUNETR
 
+
+# set random seed
+def set_seed(seed_value):
+    """Set seed for reproducibility."""
+    random.seed(seed_value)  # Python random module
+    np.random.seed(seed_value)  # NumPy
+    torch.manual_seed(seed_value)  # PyTorch
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+
+seed_value = 42
+set_seed(seed_value)
 
 # %% set up parser
 parser = argparse.ArgumentParser()
-parser.add_argument('--task_name', type=str, default='sam3d')
+parser.add_argument('--task_name', type=str, default='picai_empty_included')
 parser.add_argument('--click_type', type=str, default='random')
 parser.add_argument('--multi_click', action='store_true', default=False)
 parser.add_argument('--model_type', type=str, default='vit_b_ori')
@@ -41,23 +59,26 @@ parser.add_argument('--device', type=str, default='cuda')
 parser.add_argument('--work_dir', type=str, default='work_dir')
 
 # train
-parser.add_argument('--num_workers', type=int, default=12)
-parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0,1,2])
+parser.add_argument('--num_workers', type=int, default=8)
+parser.add_argument('--gpu_ids', type=int, nargs='+', default=[1,2,3])
 parser.add_argument('--multi_gpu', action='store_true', default=True)
 parser.add_argument('--resume', action='store_true', default=False)
 parser.add_argument('--allow_partial_weight', action='store_true', default=False)
 parser.add_argument('--hack_prompt', type=bool, default=True)
+parser.add_argument('--loss_fn', type=str, default='focal_dice')
+parser.add_argument('--MODEL_SAVE_PATH', type=str, default='./workdir')
 
-# lr_scheduler
+# lr_scheduler and optimizer
 parser.add_argument('--lr_scheduler', type=str, default='multisteplr')
-parser.add_argument('--step_size', type=list, default=[120, 180])
+parser.add_argument('--step_size', type=list, default=[1, 2])
 parser.add_argument('--gamma', type=float, default=0.1)
 parser.add_argument('--num_epochs', type=int, default=200)
 parser.add_argument('--img_size', type=int, default=128)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--accumulation_steps', type=int, default=20)
 parser.add_argument('--lr', type=float, default=8e-4)
-parser.add_argument('--weight_decay', type=float, default=0.1)
+parser.add_argument('--weight_decay', type=float, default=0.01)
+parser.add_argument('--beta', type=float, default=0.9)
 parser.add_argument('--port', type=int, default=12361)
 
 # prompt generator
@@ -65,24 +86,36 @@ parser.add_argument('-depth_wise', '--depth_wise', default=False, help='image si
 parser.add_argument('-order', '--order', default=85, help='image size', required=False)
 
 args = parser.parse_args()
-# args.lr = 8e-5
+args.lr = 1e-3
+task_name = 'picai_dice_ce'
 args.num_epochs = 50
 args.accumulation_steps = 1
 args.hack_prompt = True
+args.loss_fn = 'dice_ce'
+args.gpu_ids = [2, 3]
+args.batch_size = 1
+args.multi_gpu = False
+
+grid_search_params = {
+    "weight_decay": [0.1, 0.01],
+    "lr": [1e-3, 1e-4, 1e-5],
+    "beta": [0.9, 0.8, 0.7]
+}
+
+param_grid = ParameterGrid(grid_search_params)
 
 
 device = args.device
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
 logger = logging.getLogger(__name__)
-LOG_OUT_DIR = join(args.work_dir, args.task_name)
+args.MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
 click_methods = {
     'random': get_next_click3D_torch_2,
 }
-MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
-os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+
 
 def build_model(args):
-    freeze = (True, True, True, False)
+    freeze = (False, True, False, False)
     sam_model = sam_model_registry3D[args.model_type](checkpoint=args.checkpoint, freeze=freeze[:3]).to(device)
     prompt_model = ModelEmb(args=args, freeze=freeze[3]).to(device)
     # prompt_model = UNet(spatial_dims=3,
@@ -153,7 +186,12 @@ class BaseTrainer:
         self.norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
         
     def set_loss_fn(self):
-        self.seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+        if self.args.loss_fn == 'dice_ce':
+            self.seg_loss = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+        elif self.args.loss_fn == 'focal':
+            self.seg_loss = FocalLoss(alpha=0.95, reduction='mean')
+        elif self.args.loss_fn == 'focal_dice':
+            self.seg_loss = FocalDiceLoss(alpha=0.95)
     
     def set_optimizer(self):
         if hasattr(self.model, 'module'):
@@ -166,17 +204,17 @@ class BaseTrainer:
             prompt_model = self.prompt_model
         if self.args.hack_prompt:
             self.optimizer = torch.optim.AdamW([
-                {'params': sam_model.image_encoder.parameters()}, # , 'lr': self.args.lr * 0.1},
+                {'params': sam_model.image_encoder.parameters(), 'lr': self.args.lr * 0.1},
                 {'params': sam_model.prompt_encoder.parameters() , 'lr': self.args.lr * 0.1},
                 {'params': sam_model.mask_decoder.parameters(), 'lr': self.args.lr * 0.1},
                 {'params': prompt_model.parameters(), 'lr': self.args.lr * 0.1}
-            ], lr=self.args.lr, betas=(0.9,0.999), weight_decay=self.args.weight_decay)
+            ], lr=self.args.lr, betas=(self.args.beta, 0.999), weight_decay=self.args.weight_decay)
         else:
             self.optimizer = torch.optim.AdamW([
-                {'params': sam_model.image_encoder.parameters()},  # , 'lr': self.args.lr * 0.1},
+                {'params': sam_model.image_encoder.parameters(),  'lr': self.args.lr * 0.1},
                 {'params': sam_model.prompt_encoder.parameters(), 'lr': self.args.lr * 0.1},
                 {'params': sam_model.mask_decoder.parameters(), 'lr': self.args.lr * 0.1},
-            ], lr=self.args.lr, betas=(0.9, 0.999), weight_decay=self.args.weight_decay)
+            ], lr=self.args.lr, betas=(self.args.beta, 0.999), weight_decay=self.args.weight_decay)
 
     def set_lr_scheduler(self):
         if self.args.lr_scheduler == "multisteplr":
@@ -239,7 +277,7 @@ class BaseTrainer:
             "best_dice": self.best_dice,
             "args": self.args,
             "used_datas": img_datas,
-        }, join(MODEL_SAVE_PATH, f"{model_name}_{describe}.pth"))
+        }, join(self.args.MODEL_SAVE_PATH, f"{model_name}_{describe}.pth"))
 
     def batch_auto_forward(self, sam_model, image_embedding, dense_embeddings, gt3D):
 
@@ -298,6 +336,12 @@ class BaseTrainer:
     def auto_decode(self, sam_model, image_embedding, dense_embeddings, gt3D):
         return_loss = 0
         low_res_masks, prev_masks = self.batch_auto_forward(sam_model, image_embedding, dense_embeddings, gt3D)
+        # # make masks one-hot encoded
+        # gt3D = F.one_hot(gt3D.squeeze(1), num_classes=2)
+        # gt3D = gt3D.permute(0, 4, 1, 2, 3).contiguous()
+        # complementary_logits = -prev_masks
+        # logits_tensor = torch.cat((complementary_logits, prev_masks), dim=1)
+        # loss = self.seg_loss(logits_tensor, gt3D.to(torch.float32))
         loss = self.seg_loss(prev_masks, gt3D)
         return_loss += loss
         return prev_masks, return_loss
@@ -326,10 +370,9 @@ class BaseTrainer:
             mask_gt = (mask_gt > 0)
             
             volume_sum = mask_gt.sum() + mask_pred.sum()
-            if volume_sum == 0:
-                return np.NaN
+
             volume_intersect = (mask_gt & mask_pred).sum()
-            return 2*volume_intersect / volume_sum
+            return (2*volume_intersect + 1e-5) / (volume_sum + 1e-5)
     
         pred_masks = (prev_masks > 0.5)
         true_masks = (gt3D > 0)
@@ -366,6 +409,8 @@ class BaseTrainer:
 
         self.optimizer.zero_grad()
         step_loss = 0
+        volumes = []
+        dices = []
         for step, (image3D, gt3D) in enumerate(tbar):
 
             my_context1 = self.model.no_sync if hasattr(self.model, 'module') and step % self.args.accumulation_steps != 0 else nullcontext
@@ -405,19 +450,23 @@ class BaseTrainer:
 
                     self.scaler.scale(loss).backward()
 
-            if step % self.args.accumulation_steps == 0 and step != 0:
+            if step % self.args.accumulation_steps == 0:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
 
+                step_loss += cur_loss
                 print_loss = step_loss / self.args.accumulation_steps
                 step_loss = 0
-                print_dice = self.get_dice_score(prev_masks, gt3D)
+                print_dice = self.get_dice_score(torch.sigmoid(pred_mask), gt3D)
             else:
                 step_loss += cur_loss
 
             if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
-                if step % self.args.accumulation_steps == 0 and step != 0:
+                if step % self.args.accumulation_steps == 0:
+                    # target_volume = gt3D.sum().detach().cpu()
+                    # volumes.append(target_volume)
+                    # dices.append(print_dice.detach().cpu())
                     print(f'Epoch: {epoch}, Step: {step}, Loss: {print_loss}, Dice: {print_dice}')
                     if print_dice > self.step_best_dice:
                         self.step_best_dice = print_dice
@@ -450,7 +499,7 @@ class BaseTrainer:
         plt.title(description)
         plt.xlabel('Epoch')
         plt.ylabel(f'{save_name}')
-        plt.savefig(join(MODEL_SAVE_PATH, f'{save_name}.png'))
+        plt.savefig(join(self.args.MODEL_SAVE_PATH, f'{save_name}.png'))
         plt.close()
 
 
@@ -575,28 +624,150 @@ def device_config(args):
     except RuntimeError as e:
         print(e)
 
+def get_dice_score(prev_masks, gt3D):
+    def compute_dice(mask_pred, mask_gt):
+        mask_threshold = 0.5
+        mask_pred = (mask_pred > mask_threshold)
+        mask_gt = (mask_gt > 0)
+        volume_sum = mask_gt.sum() + mask_pred.sum()
+        volume_intersect = (mask_gt & mask_pred).sum()
+        return (2 * volume_intersect + 1e-5) / (volume_sum + 1e-5)
+    pred_masks = (prev_masks > 0.5)
+    true_masks = (gt3D > 0)
+    dice_list = []
+    for i in range(true_masks.shape[0]):
+        dice_list.append(compute_dice(pred_masks[i], true_masks[i]))
+    return (sum(dice_list) / len(dice_list)).item()
+def train_one_epoch(epoch, model, dataloaders, optimizer, norm_transform, criterion, scaler):
+    epoch_loss = 0
+    epoch_iou = 0
+    epoch_dice = 0
+    model.train()
+
+    tbar = dataloaders
+
+    optimizer.zero_grad()
+    step_loss = 0
+    volumes = []
+    dices = []
+    step_best_dice = 0
+    step_best_loss = np.inf
+    for step, (image3D, gt3D) in enumerate(tbar):
+
+        my_context1 = nullcontext
+        my_context2 = nullcontext
+
+        with my_context1():
+            with my_context2():
+
+                image3D = norm_transform(image3D.squeeze(dim=1))  # (N, C, W, H, D)
+                image3D = image3D.unsqueeze(dim=1)
+
+                image3D = image3D.to(device)
+                gt3D = gt3D.to(device).type(torch.long)
+                with amp.autocast():
+                    pred = model(image3D)
+                    loss = criterion(pred, gt3D)
+                pred_mask = pred.clone().detach()
+                epoch_dice += get_dice_score(torch.sigmoid(pred_mask), gt3D)
+
+                epoch_loss += loss.item()
+
+                cur_loss = loss.item()
+
+                scaler.scale(loss).backward()
+
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        step_loss += cur_loss
+        print_loss = step_loss
+        step_loss = 0
+        print_dice = get_dice_score(torch.sigmoid(pred_mask), gt3D)
+
+        print(f'Epoch: {epoch}, Step: {step}, Loss: {print_loss}, Dice: {print_dice}')
+        if print_dice > step_best_dice:
+            step_best_dice = print_dice
+        if print_loss < step_best_loss:
+            step_best_loss = print_loss
+
+    epoch_loss /= step
+    epoch_dice /= step
+    return epoch_loss, epoch_dice
+def plot_result(self, plot_data, description, save_name):
+    plt.plot(plot_data)
+    plt.title(description)
+    plt.xlabel('Epoch')
+    plt.ylabel(f'{save_name}')
+    plt.savefig(join('./', f'{save_name}.png'))
+    plt.close()
 
 def main():
-    mp.set_sharing_strategy('file_system')
-    device_config(args)
-    if args.multi_gpu:
-        mp.spawn(
-            main_worker,
-            nprocs=args.world_size,
-            args=(args, )
-        )
-    else:
-        random.seed(2023)
-        np.random.seed(2023)
-        torch.manual_seed(2023)
-        # Load datasets
-        dataloaders = get_dataloaders(args)
-        # Build model
-        model = build_model(args)
-        # Create trainer
-        trainer = BaseTrainer(model, dataloaders, args)
-        # Train
-        trainer.train()
+    for params in param_grid:
+        global task_name
+        args.task_name = task_name
+        for param_name, param in params.items():
+            exec(f'args.{param_name} = {param}')
+            args.task_name += f'_{param_name}_{param}'
+
+        args.MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
+        os.makedirs(args.MODEL_SAVE_PATH, exist_ok=True)
+        mp.set_sharing_strategy('file_system')
+        device_config(args)
+        if args.multi_gpu:
+            mp.spawn(
+                main_worker,
+                nprocs=args.world_size,
+                args=(args, )
+            )
+        else:
+            random.seed(2023)
+            np.random.seed(2023)
+            torch.manual_seed(2023)
+            # Load datasets
+            dataloaders = get_dataloaders(args)
+            # Build model
+            # model = build_model(args)
+            model = SwinUNETR(
+            img_size=(128, 128, 128),
+            in_channels=1,
+            out_channels=1,
+            feature_size=48,
+            use_checkpoint=False,
+        ).to(device)
+            # # Create trainer
+            # trainer = BaseTrainer(model, dataloaders, args)
+            # # Train
+            # trainer.train()
+            norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
+            scaler = amp.GradScaler()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
+                                                                [1, 2],
+                                                                0.1)
+            criterion = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
+            losses = []
+            dices = []
+            best_dice = 0
+
+            for epoch in range(args.num_epochs):
+                print(f'Epoch: {epoch}/{args.num_epochs - 1}')
+
+                epoch_loss, epoch_dice = train_one_epoch(epoch, model, dataloaders, optimizer, norm_transform, criterion, scaler)
+
+                lr_scheduler.step()
+
+                losses.append(epoch_loss)
+                dices.append(epoch_dice)
+                print(f'EPOCH: {epoch}, Loss: {epoch_loss}')
+                print(f'EPOCH: {epoch}, Dice: {epoch_dice}')
+
+                    # save train dice best checkpoint
+                if epoch_dice > best_dice:
+                    best_dice = epoch_dice
+
+                plot_result(losses, 'Dice + Cross Entropy Loss', 'Loss', 'loss')
+                plot_result(dices, 'Dice', 'Dice', 'dice')
 
 def main_worker(rank, args):
     setup(rank, args.world_size)
@@ -614,7 +785,7 @@ def main_worker(rank, args):
         datefmt='%Y/%m/%d %H:%M:%S',
         level=logging.INFO if rank in [-1, 0] else logging.WARN,
         filemode='w',
-        filename=os.path.join(LOG_OUT_DIR, f'output_{cur_time}.log'))
+        filename=os.path.join(args.MODEL_SAVE_PATH, f'output_{cur_time}.log'))
     
     dataloaders = get_dataloaders(args)
     model, prompt_model = build_model(args)

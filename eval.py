@@ -7,6 +7,7 @@ import os
 
 from models.model_single import ModelEmb
 from models.unet import UNet
+from utils.plot import plot_segmentation2D
 
 join = os.path.join
 from tqdm import tqdm
@@ -67,10 +68,10 @@ args.num_epochs = 50
 args.accumulation_steps = 1
 args.hack_prompt = True
 
-data_path = './sam3d_train/medical_preprocessed/PCa_lesion/PROMISE12_mr_unknown/imagesTs'
-label_path = './sam3d_train/medical_preprocessed/PCa_lesion/PROMISE12_mr_unknown/imagesTs'
+data_path = './sam3d_train/medical_preprocessed/PCa_lesion/picai/imagesTs'
+label_path = './sam3d_train/medical_preprocessed/PCa_lesion/picai/labelsTs'
 
-MODEL_SAVE_PATH = join('./work_dir', 'hack_prompt')
+MODEL_SAVE_PATH = join('./work_dir', 'picai_empty_unincluded_dice_ce')
 
 sam_model_name = 'sam_model_dice_best.pth'
 prompt_model_name = 'prompt_model_dice_best.pth'
@@ -103,7 +104,7 @@ def get_dice_score(prev_masks, gt3D):
         if volume_sum == 0:
             return np.NaN
         volume_intersect = (mask_gt & mask_pred).sum()
-        return 2 * volume_intersect / volume_sum
+        return ((2 * volume_intersect) + 1e-5) / (volume_sum + 1e-5)
 
     pred_masks = (prev_masks > 0.5)
     true_masks = (gt3D > 0)
@@ -112,67 +113,12 @@ def get_dice_score(prev_masks, gt3D):
         dice_list.append(compute_dice(pred_masks[i], true_masks[i]))
     return (sum(dice_list) / len(dice_list)).item()
 
-def plot_segmentation2D(img3D, prev_masks, gt3D, save_path, slice_axis=2, image_dice=None):
-    """
-        Plot each slice of a 3D image, its corresponding previous mask, and ground truth mask.
-
-        Parameters:
-        img3D (numpy.ndarray): The 3D image array of shape (depth, height, width).
-        prev_masks (numpy.ndarray): The 3D array of previous masks of shape (depth, height, width).
-        gt3D (numpy.ndarray): The 3D array of ground truth masks of shape (depth, height, width).
-        slice_axis (int): The axis along which to slice the image (0=depth, 1=height, 2=width).
-        """
-    os.makedirs(save_path, exist_ok=True)
-    # Determine the number of slices based on the selected axis
-    num_slices = img3D.shape[slice_axis]
-
-    # Iterate over each slice
-    for i in range(num_slices):
-        fig, axes = plt.subplots(nrows=1, ncols=3, figsize=(15, 5))
-        # Slicing the numpy array along the specified axis
-        if slice_axis == 0:
-            img_slice = img3D[i, :, :]
-            prev_mask_slice = prev_masks[i, :, :]
-            gt_slice = gt3D[i, :, :]
-        elif slice_axis == 1:
-            img_slice = img3D[:, i, :]
-            prev_mask_slice = prev_masks[:, i, :]
-            gt_slice = gt3D[:, i, :]
-        else:
-            img_slice = img3D[:, :, i]
-            prev_mask_slice = prev_masks[:, :, i]
-            gt_slice = gt3D[:, :, i]
-
-        # Plot image slice
-        ax = axes[0]
-        ax.imshow(img_slice, cmap='gray')
-        ax.set_title(f'Slice {i + 1} - Image')
-        ax.axis('off')
-
-        # Plot previous mask slice
-        cmap = plt.cm.get_cmap('viridis', 1)
-        ax = axes[1]
-        ax.imshow(img_slice, cmap='gray')
-        ax.imshow(prev_mask_slice, cmap=cmap, alpha=0.5)
-        ax.set_title(f'Slice {i + 1} - Predict Mask')
-        ax.axis('off')
-
-        # Plot ground truth slice
-        cmap = plt.cm.get_cmap('viridis', 1)
-        ax = axes[2]
-        ax.imshow(img_slice, cmap='gray')
-        ax.imshow(gt_slice, cmap=cmap, alpha=0.5)
-        ax.set_title(f'Slice {i + 1} - Ground Truth')
-        ax.axis('off')
-
-        plt.tight_layout()
-        plt.savefig(join(save_path, f'slice_{i}'))
 
 def get_test_dataloaders(args):
     test_dataset = Dataset_Union_ALL(paths=img_datas, mode='test', data_type='Ts', transform=tio.Compose([
         tio.ToCanonical(),
         tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
-        tio.RandomFlip(axes=(0, 1, 2)),
+        # tio.RandomFlip(axes=(0, 1, 2)),
     ]),
     threshold=1000)
 
@@ -221,9 +167,24 @@ else:
     tbar = test_dataloader
 
 norm_transform = tio.ZNormalization(masking_method=lambda x: x > 0)
-for step, (image3D, gt3D, image_path) in enumerate(tbar):
+for step, (image3D, gt3D, image_path, orig_shape) in enumerate(tbar):
     image3D = norm_transform(image3D.squeeze(dim=1))  # (N, C, W, H, D)
     image3D = image3D.unsqueeze(dim=1)
+    orig_shape = tuple([i.item() for i in orig_shape])
+
+    # get original image
+    reverse_transform = tio.Compose([
+        tio.CropOrPad(mask_name='label', target_shape=orig_shape), # crop only object region
+        # tio.RandomFlip(axes=(0, 1, 2)),
+    ])
+    subject = tio.Subject(
+        image=tio.ScalarImage(tensor=image3D.squeeze(0)),
+        label=tio.LabelMap(tensor=gt3D.squeeze(0)),
+    )
+
+    orig_subject = reverse_transform(subject)
+    orig_img3D = orig_subject.image.data
+    orig_gt3D = orig_subject.label.data
 
     image3D = image3D.to(device)
     gt3D = gt3D.to(device).type(torch.long)
@@ -235,7 +196,18 @@ for step, (image3D, gt3D, image_path) in enumerate(tbar):
         else:
             image_embedding = sam_model.image_encoder(image3D)
             raise NotImplementedError
-    pred_mask = prev_masks.clone().detach()
-    image_dice = get_dice_score(torch.sigmoid(pred_mask), gt3D)
+    # get original sized prediction
+    pred_subject = tio.Subject(
+        image=tio.ScalarImage(tensor=prev_masks.squeeze(0).detach().cpu()),
+        label=tio.LabelMap(tensor=gt3D.squeeze(0).detach().cpu()),
+    )
+    pred_subject = reverse_transform(pred_subject)
+    orig_pred_mask = pred_subject.image.data.unsqueeze(0)
+
+    # pred_mask = prev_masks.clone().detach()
+    # image_dice = get_dice_score(torch.sigmoid(pred_mask), gt3D)
+    # pred_mask_b = (torch.sigmoid(pred_mask) > 0.5)
+    pred_mask = orig_pred_mask.clone().detach()
+    image_dice = get_dice_score(torch.sigmoid(pred_mask), orig_gt3D)
     pred_mask_b = (torch.sigmoid(pred_mask) > 0.5)
-    plot_segmentation2D(image3D.squeeze(0).squeeze(0).cpu().numpy(), pred_mask_b.squeeze(0).squeeze(0).cpu().numpy(), gt3D.squeeze(0).squeeze(0).cpu().numpy(), join(result_path, str(step)+'_'+ image_path[0].split('/')[3] + '_' + image_path[0].split('/')[4]), image_dice=image_dice)
+    plot_segmentation2D(orig_img3D.squeeze(0).squeeze(0).cpu().numpy(), pred_mask_b.squeeze(0).squeeze(0).cpu().numpy(), orig_gt3D.squeeze(0).squeeze(0).cpu().numpy(), join(result_path, str(step)+'_'+ image_path[0].split('/')[3] + '_' + image_path[0].split('/')[4]), image_dice=image_dice)
