@@ -1,8 +1,8 @@
-img_datas = ['./sam3d_train/medical_preprocessed/PCa_lesion/PROMISE12_mr_unknown']
+img_datas = ['./sam3d_train/medical_preprocessed/PCa_lesion/picai']
 
 all_classes = ['PCa_lesion']
 
-all_datasets = ['PROMISE12_mr_unknown']
+all_datasets = ['picai']
 
 # img_datas = [
 # 'sam3d_train/medical_data_all/COVID_lesion/COVID1920_ct',

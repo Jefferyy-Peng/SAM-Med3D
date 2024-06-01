@@ -83,8 +83,8 @@ class Dataset_Union_ALL(Dataset):
                                         target_shape=(self.image_size,self.image_size,self.image_size))(subject)
 
         # don't want to ignore empty cases
-        # if subject.label.data.sum() <= self.threshold:
-        #     return self.__getitem__(np.random.randint(self.__len__()))
+        if subject.label.data.sum() <= self.threshold:
+            return self.__getitem__(np.random.randint(self.__len__()))
         
         if self.mode == "train" and self.data_type == 'Tr':
             return subject.image.data.clone().detach().to(torch.int32), subject.label.data.clone().detach().to(torch.int8)

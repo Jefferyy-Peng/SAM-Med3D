@@ -64,19 +64,20 @@ parser.add_argument('-order', '--order', default=85, help='image size', required
 
 args = parser.parse_args()
 # args.lr = 8e-5
-args.num_epochs = 50
+args.num_epochs = 1
 args.accumulation_steps = 1
 args.hack_prompt = True
+args.multi_gpu = False
 
 data_path = './sam3d_train/medical_preprocessed/PCa_lesion/picai/imagesTs'
 label_path = './sam3d_train/medical_preprocessed/PCa_lesion/picai/labelsTs'
 
-MODEL_SAVE_PATH = join('./work_dir', 'picai_empty_unincluded_dice_ce')
+MODEL_SAVE_PATH = join('./work_dir', 'picai_dice_ce_beta_0.9_lr_0.001_weight_decay_0.01')
 
 sam_model_name = 'sam_model_dice_best.pth'
 prompt_model_name = 'prompt_model_dice_best.pth'
 
-device = 'cuda'
+device = 'cuda:0'
 
 model_type = 'vit_b_ori'
 
@@ -117,7 +118,8 @@ def get_dice_score(prev_masks, gt3D):
 def get_test_dataloaders(args):
     test_dataset = Dataset_Union_ALL(paths=img_datas, mode='test', data_type='Ts', transform=tio.Compose([
         tio.ToCanonical(),
-        tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
+        # tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
+        tio.Resize(target_shape=(args.img_size, args.img_size, args.img_size)),
         # tio.RandomFlip(axes=(0, 1, 2)),
     ]),
     threshold=1000)
@@ -174,7 +176,8 @@ for step, (image3D, gt3D, image_path, orig_shape) in enumerate(tbar):
 
     # get original image
     reverse_transform = tio.Compose([
-        tio.CropOrPad(mask_name='label', target_shape=orig_shape), # crop only object region
+        # tio.CropOrPad(mask_name='label', target_shape=orig_shape), # crop only object region
+        tio.Resize(target_shape=orig_shape),
         # tio.RandomFlip(axes=(0, 1, 2)),
     ])
     subject = tio.Subject(
@@ -198,7 +201,7 @@ for step, (image3D, gt3D, image_path, orig_shape) in enumerate(tbar):
             raise NotImplementedError
     # get original sized prediction
     pred_subject = tio.Subject(
-        image=tio.ScalarImage(tensor=prev_masks.squeeze(0).detach().cpu()),
+        image=tio.ScalarImage(tensor=prev_masks.float().squeeze(0).detach().cpu()),
         label=tio.LabelMap(tensor=gt3D.squeeze(0).detach().cpu()),
     )
     pred_subject = reverse_transform(pred_subject)
@@ -209,5 +212,6 @@ for step, (image3D, gt3D, image_path, orig_shape) in enumerate(tbar):
     # pred_mask_b = (torch.sigmoid(pred_mask) > 0.5)
     pred_mask = orig_pred_mask.clone().detach()
     image_dice = get_dice_score(torch.sigmoid(pred_mask), orig_gt3D)
+    print(image_dice)
     pred_mask_b = (torch.sigmoid(pred_mask) > 0.5)
-    plot_segmentation2D(orig_img3D.squeeze(0).squeeze(0).cpu().numpy(), pred_mask_b.squeeze(0).squeeze(0).cpu().numpy(), orig_gt3D.squeeze(0).squeeze(0).cpu().numpy(), join(result_path, str(step)+'_'+ image_path[0].split('/')[3] + '_' + image_path[0].split('/')[4]), image_dice=image_dice)
+    # plot_segmentation2D(orig_img3D.squeeze(0).squeeze(0).cpu().numpy(), pred_mask_b.squeeze(0).squeeze(0).cpu().numpy(), orig_gt3D.squeeze(0).squeeze(0).cpu().numpy(), join(result_path, str(step)+'_'+ image_path[0].split('/')[3] + '_' + image_path[0].split('/')[4]), image_dice=image_dice)

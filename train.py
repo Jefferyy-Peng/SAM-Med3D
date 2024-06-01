@@ -34,6 +34,7 @@ from utils.data_paths import img_datas
 import torch.nn.functional as F
 from sklearn.model_selection import ParameterGrid
 from monai.networks.nets import SwinUNETR
+from utils.plot import plot_segmentation2D
 
 
 # set random seed
@@ -61,7 +62,7 @@ parser.add_argument('--work_dir', type=str, default='work_dir')
 # train
 parser.add_argument('--num_workers', type=int, default=8)
 parser.add_argument('--gpu_ids', type=int, nargs='+', default=[1,2,3])
-parser.add_argument('--multi_gpu', action='store_true', default=True)
+parser.add_argument('--multi_gpu', action='store_true', default=False)
 parser.add_argument('--resume', action='store_true', default=False)
 parser.add_argument('--allow_partial_weight', action='store_true', default=False)
 parser.add_argument('--hack_prompt', type=bool, default=True)
@@ -88,17 +89,17 @@ parser.add_argument('-order', '--order', default=85, help='image size', required
 args = parser.parse_args()
 args.lr = 1e-3
 task_name = 'picai_dice_ce'
-args.num_epochs = 50
+args.num_epochs = 200
 args.accumulation_steps = 1
 args.hack_prompt = True
 args.loss_fn = 'dice_ce'
-args.gpu_ids = [0, 1, 2, 3]
+args.gpu_ids = [6]
 args.batch_size = 1
-args.multi_gpu = True
+args.multi_gpu = False
 
 grid_search_params = {
     "weight_decay": [0.01],
-    "lr": [1e-3],
+    "lr": [4e-3],
     "beta": [0.9]
 }
 
@@ -106,7 +107,7 @@ param_grid = ParameterGrid(grid_search_params)
 
 
 device = args.device
-os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
+# os.environ["CUDA_VISIBLE_DEVICES"] = ','.join([str(i) for i in args.gpu_ids])
 logger = logging.getLogger(__name__)
 args.MODEL_SAVE_PATH = join(args.work_dir, args.task_name)
 click_methods = {
@@ -135,14 +136,41 @@ def build_model(args):
             prompt_model = DDP(prompt_model, device_ids=[args.rank], output_device=args.rank, find_unused_parameters=True)
     return sam_model, prompt_model
 
+def get_test_dataloaders(args):
+    test_dataset = Dataset_Union_ALL(paths=img_datas, mode='test', data_type='Ts', transform=tio.Compose([
+        tio.ToCanonical(),
+        # tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
+        tio.Resize(target_shape=(args.img_size, args.img_size, args.img_size)),
+        # tio.RandomFlip(axes=(0, 1, 2)),
+    ]),
+    threshold=0)
+
+    if args.multi_gpu:
+        test_sampler = DistributedSampler(test_dataset)
+        shuffle = False
+    else:
+        test_sampler = None
+        shuffle = True
+
+    test_dataloader = Union_Dataloader(
+        dataset=test_dataset,
+        sampler=test_sampler,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    return test_dataloader
 
 def get_dataloaders(args):
     train_dataset = Dataset_Union_ALL(paths=img_datas, transform=tio.Compose([
         tio.ToCanonical(),
-        tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
-        tio.RandomFlip(axes=(0, 1, 2)),
+        # tio.CropOrPad(mask_name='label', target_shape=(args.img_size,args.img_size,args.img_size)), # crop only object region
+        # tio.CropOrPad(target_shape=(args.img_size,args.img_size,args.img_size)),
+        tio.Resize(target_shape=(args.img_size,args.img_size,args.img_size)),
+        # tio.RandomFlip(axes=(0, 1, 2)),
     ]),
-    threshold=1000)
+    threshold=0)
 
     if args.multi_gpu:
         train_sampler = DistributedSampler(train_dataset)
@@ -162,11 +190,12 @@ def get_dataloaders(args):
     return train_dataloader
 
 class BaseTrainer:
-    def __init__(self, model, prompt_model, dataloaders, args):
+    def __init__(self, model, prompt_model, dataloaders, test_loaders, args):
 
         self.model = model
         self.prompt_model = prompt_model
         self.dataloaders = dataloaders
+        self.test_loaders = test_loaders
         self.args = args
         self.best_loss = np.inf
         self.best_dice = 0.0
@@ -174,6 +203,8 @@ class BaseTrainer:
         self.step_best_dice = 0.0
         self.losses = []
         self.dices = []
+        self.eval_losses = []
+        self.eval_dices = []
         self.ious = []
         self.set_loss_fn()
         self.set_optimizer()
@@ -440,7 +471,8 @@ class BaseTrainer:
 
                             prev_masks, loss = self.interaction(sam_model, image_embedding, gt3D, num_clicks=11)
                     pred_mask = prev_masks.clone().detach()
-                    epoch_dice += self.get_dice_score(torch.sigmoid(pred_mask), gt3D)
+                    dice_score = self.get_dice_score(torch.sigmoid(pred_mask), gt3D)
+                    epoch_dice += dice_score
 
                     epoch_loss += loss.item()
 
@@ -468,6 +500,91 @@ class BaseTrainer:
                     # volumes.append(target_volume)
                     # dices.append(print_dice.detach().cpu())
                     print(f'Epoch: {epoch}, Step: {step}, Loss: {print_loss}, Dice: {print_dice}')
+
+        epoch_loss /= step
+        epoch_dice /= step
+
+        return epoch_loss, epoch_iou, epoch_dice, pred_list
+
+    def eval_epoch(self, epoch):
+        epoch_loss = 0
+        epoch_dice = 0
+        self.model.eval()
+        if hasattr(self.model, 'module'):
+            sam_model = self.model.module
+        else:
+            sam_model = self.model
+            # self.args.rank = -1
+
+        if hasattr(self.prompt_model, 'module'):
+            prompt_model = self.prompt_model.module
+        else:
+            prompt_model = self.prompt_model
+            # self.args.rank = -1
+
+        if not self.args.multi_gpu:
+            self.args.rank = -1
+
+        if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
+            tbar = tqdm(self.test_loaders)
+        else:
+            tbar = self.test_loaders
+
+        step_loss = 0
+        volumes = []
+        dices = []
+        for step, (image3D, gt3D, image_path, orig_shape) in enumerate(tbar):
+
+            my_context1 = self.model.no_sync if hasattr(self.model,
+                                                        'module') and step % self.args.accumulation_steps != 0 else nullcontext
+            my_context2 = self.prompt_model.no_sync if hasattr(self.prompt_model,
+                                                               'module') and step % self.args.accumulation_steps != 0 else nullcontext
+
+            with my_context1():
+                with my_context2():
+
+                    image3D = self.norm_transform(image3D.squeeze(dim=1))  # (N, C, W, H, D)
+                    image3D = image3D.unsqueeze(dim=1)
+
+                    image3D = image3D.to(device)
+                    gt3D = gt3D.to(device).type(torch.long)
+                    with amp.autocast():
+                        if self.args.hack_prompt:
+                            image_embedding = sam_model.image_encoder(image3D)
+                            dense_embeddings = prompt_model(image3D)
+                            prev_masks, loss = self.auto_decode(sam_model, image_embedding, dense_embeddings, gt3D)
+                        else:
+                            image_embedding = sam_model.image_encoder(image3D)
+
+                            self.click_points = []
+                            self.click_labels = []
+
+                            prev_masks, loss = self.interaction(sam_model, image_embedding, gt3D, num_clicks=11)
+                    pred_mask = prev_masks.clone().detach()
+                    dice_score = self.get_dice_score(torch.sigmoid(pred_mask), gt3D)
+                    epoch_dice += dice_score
+
+                    epoch_loss += loss.item()
+
+                    cur_loss = loss.item()
+
+                    loss /= self.args.accumulation_steps
+
+
+            if step % self.args.accumulation_steps == 0:
+                step_loss += cur_loss
+                print_loss = step_loss / self.args.accumulation_steps
+                step_loss = 0
+                print_dice = dice_score
+            else:
+                step_loss += cur_loss
+
+            if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
+                if step % self.args.accumulation_steps == 0:
+                    # target_volume = gt3D.sum().detach().cpu()
+                    # volumes.append(target_volume)
+                    # dices.append(print_dice.detach().cpu())
+                    print(f'Eval Epoch: {epoch}, Step: {step}, Loss: {print_loss}, Dice: {print_dice}')
                     if print_dice > self.step_best_dice:
                         self.step_best_dice = print_dice
                         if print_dice > 0.9:
@@ -485,14 +602,11 @@ class BaseTrainer:
                             )
                     if print_loss < self.step_best_loss:
                         self.step_best_loss = print_loss
-            
+
         epoch_loss /= step
         epoch_dice /= step
 
-        return epoch_loss, epoch_iou, epoch_dice, pred_list
-
-    def eval_epoch(self, epoch, num_clicks):
-        return 0
+        return epoch_loss, epoch_dice
     
     def plot_result(self, plot_data, description, save_name):
         plt.plot(plot_data)
@@ -514,6 +628,8 @@ class BaseTrainer:
             num_clicks = np.random.randint(1, 21)
             epoch_loss, epoch_iou, epoch_dice, pred_list = self.train_epoch(epoch, num_clicks)
 
+            eval_loss, eval_dice = self.eval_epoch(epoch)
+
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
             if self.args.multi_gpu:
@@ -522,6 +638,8 @@ class BaseTrainer:
             if not self.args.multi_gpu or (self.args.multi_gpu and self.args.rank == 0):
                 self.losses.append(epoch_loss)
                 self.dices.append(epoch_dice)
+                self.eval_losses.append(eval_loss)
+                self.eval_dices.append(eval_dice)
                 print(f'EPOCH: {epoch}, Loss: {epoch_loss}')
                 print(f'EPOCH: {epoch}, Dice: {epoch_dice}')
                 logger.info(f'Epoch\t {epoch}\t : loss: {epoch_loss}, dice: {epoch_dice}')
@@ -586,6 +704,8 @@ class BaseTrainer:
 
                 self.plot_result(self.losses, 'Dice + Cross Entropy Loss', 'Loss')
                 self.plot_result(self.dices, 'Dice', 'Dice')
+                self.plot_result(self.eval_losses, 'Eval Dice + Cross Entropy Loss', 'Eval_Loss')
+                self.plot_result(self.eval_dices, 'Eval Dice', 'Eval_Dice')
         logger.info('=====================================================================')
         logger.info(f'Best loss: {self.best_loss}')
         logger.info(f'Best dice: {self.best_dice}')
@@ -648,10 +768,13 @@ def main():
             torch.manual_seed(2023)
             # Load datasets
             dataloaders = get_dataloaders(args)
+            # Load test datasets
+            test_loaders = get_test_dataloaders(args)
             # Build model
-            model = build_model(args)
+            model, prompt_model = build_model(args)
             # # Create trainer
-            trainer = BaseTrainer(model, dataloaders, args)
+
+            trainer = BaseTrainer(model, prompt_model, dataloaders, test_loaders, args)
             # # Train
             trainer.train()
 
@@ -674,8 +797,9 @@ def main_worker(rank, args):
         filename=os.path.join(args.MODEL_SAVE_PATH, f'output_{cur_time}.log'))
     
     dataloaders = get_dataloaders(args)
+    test_loaders = get_test_dataloaders(args)
     model, prompt_model = build_model(args)
-    trainer = BaseTrainer(model, prompt_model, dataloaders, args)
+    trainer = BaseTrainer(model, prompt_model, dataloaders, test_loaders, args)
     trainer.train()
     cleanup()
 
